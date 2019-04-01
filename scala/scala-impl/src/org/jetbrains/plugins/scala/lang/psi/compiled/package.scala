@@ -2,82 +2,60 @@ package org.jetbrains.plugins.scala
 package lang
 package psi
 
+import com.intellij.ide.highlighter.JavaClassFileType
 import com.intellij.openapi.vfs.VirtualFile
-
-import scala.annotation.tailrec
-import scala.reflect.NameTransformer.decode
 
 package object compiled {
 
-  private[this] type SiblingsNames = Seq[String]
+  private val ClassFileExtension = JavaClassFileType.INSTANCE.getDefaultExtension
 
-  private[this] val ClassFileExtension = "class"
+  private def classFileName(withoutExtension: String) = s"$withoutExtension.$ClassFileExtension"
 
-  implicit class VirtualFileExt(private val virtualFile: VirtualFile) extends AnyVal {
+  implicit class VirtualFileExt(val virtualFile: VirtualFile) extends AnyVal {
 
-    def isInnerClass: Boolean = {
-      def isClass(file: VirtualFile) =
-        file.getExtension == ClassFileExtension
+    private def topLevelScalaClass: Option[String] = {
+      val parent = virtualFile.getParent
 
-      !isClass(virtualFile) && {
-        validSiblingsNames(isClass).map(decode) match {
-          case Seq() => false
-          case seq =>
-            implicit val siblingsNames: SiblingsNames = seq
-            virtualFile.getNameWithoutExtension match {
-              case EndsWithDollar(name) if accepts(name) => false // let's handle it separately to avoid giving it for Java.
-              case name => isInnerImpl(decode(name))
-            }
-        }
+      if (parent == null || virtualFile.getExtension != ClassFileExtension)
+        return None
+
+      val prefixes = new PrefixIterator(virtualFile.getNameWithoutExtension)
+
+      prefixes.filter(!_.endsWith("$")).find { prefix =>
+        val candidate = parent.findChild(classFileName(prefix))
+        candidate != null && canBeDecompiled(candidate)
       }
     }
 
-    def isAcceptable: Boolean = {
-      def isScalaFile(file: VirtualFile) = DecompilationResult.tryDecompile(file).isDefined
+    def isScalaCompiledClassFile: Boolean = topLevelScalaClass.nonEmpty
 
-      isScalaFile(virtualFile) ||
-        isAcceptableImpl("", virtualFile.getNameWithoutExtension) {
-          validSiblingsNames(isScalaFile)
-        }
-    }
-
-    private def validSiblingsNames(predicate: VirtualFile => Boolean) =
-      virtualFile.getParent match {
-        case null => Seq.empty
-        case parent => parent.getChildren.toSeq.filter(predicate).map(_.getNameWithoutExtension)
-      }
-  }
-
-  private[this] object SplitAtDollar {
-
-    def unapply(string: String): Option[(String, String)] = string.split("\\$", 2) match {
-      case Array(prefix, suffix) => Some(prefix, suffix)
-      case _ => None
+    def isScalaInnerClass: Boolean = {
+      val fileName = virtualFile.getNameWithoutExtension
+      !topLevelScalaClass.contains(fileName)
     }
   }
 
-  private[this] val EndsWithDollar = "(.+)\\$$".r
+  private def canBeDecompiled(file: VirtualFile): Boolean = DecompilationResult.tryDecompile(file).isDefined
 
-  @tailrec
-  private[this] def isInnerImpl(suffix: String)
-                               (implicit siblingsNames: SiblingsNames): Boolean = suffix match {
-    case SplitAtDollar(newPrefix, newSuffix) =>
-      accepts(newPrefix) || isInnerImpl(newSuffix)
-    case _ => false
-  }
+  private class PrefixIterator(fullName: String) extends Iterator[String] {
+    private var currentPrefixEnd = -1
 
-  private[this] def accepts(newPrefix: String)
-                           (implicit siblingsNames: SiblingsNames) =
-    siblingsNames.exists(_ != newPrefix)
+    def hasNext: Boolean = currentPrefixEnd < fullName.length
 
-  @tailrec
-  private[this] def isAcceptableImpl(prefix: String, suffix: String)
-                                    (implicit siblingsNames: SiblingsNames): Boolean = suffix match {
-    case SplitAtDollar(suffixPrefix, suffixSuffix) =>
-      prefix + suffixPrefix match {
-        case newPrefix if !newPrefix.endsWith("$") && siblingsNames.contains(newPrefix) => true
-        case newPrefix => isAcceptableImpl(newPrefix + '$', suffixSuffix)
+    def next(): String = {
+      val prefix = nextPrefix(fullName, currentPrefixEnd)
+      currentPrefixEnd = prefix.length
+      prefix
+    }
+
+    private def nextPrefix(fullName: String, previousPrefixEnd: Int = -1): String = {
+      if (previousPrefixEnd == fullName.length) null
+      else {
+        val nextDollarIndex = fullName.indexOf('$', previousPrefixEnd + 1)
+
+        if (nextDollarIndex >= 0) fullName.substring(0, nextDollarIndex)
+        else fullName
       }
-    case _ => false
+    }
   }
 }
